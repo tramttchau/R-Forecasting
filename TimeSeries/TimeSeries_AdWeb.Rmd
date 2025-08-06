@@ -1,0 +1,754 @@
+---
+title: 'Phân tích chuỗi thời gian: Ad Cost & Viewer Count của website cá nhân'
+author: "Châu Thị Tuyết Trâm"
+date: "2025-06-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Import libraries:**
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tseries)
+library(forecast)
+library(astsa)
+library(Metrics)
+library(scales)
+```
+
+#### *Step 1: Chuẩn bị và khám phá dữ liệu*
+**Load dữ liệu:**
+```{r}
+web_data <- read.csv(file = "final_website_stats.csv")
+web_data
+```
+
+
+```{r}
+cat("Cấu trúc dữ liệu:\n")
+str(web_data)
+cat("\nKích thước dữ liệu:", dim(web_data), "\n")
+cat("Tên các cột:", names(web_data), "\n")
+```
+##### **Thông tin về bộ dữ liệu:**     
+         
+Bộ dữ liệu có tên **"Chi phí quảng cáo & lượt truy cập trang cá nhân"** (tên gốc: *Personal Ecommerce Website Ad Cost & Viewer Count*), được thu thập từ nền tảng Kaggle (https://www.kaggle.com/datasets/michealknight/personal-ecommerce-website-ad-cost-and-viewer-count). Dữ liệu bao gồm **1096 quan sát hằng ngày**, ghi nhận liên tục từ **ngày 01/01/2022 đến 31/12/2024**, phản ánh lưu lượng truy cập và mức độ tương tác của người dùng trên trang web thương mại điện tử, cung cấp góc nhìn toàn diện về cách hành vi người dùng thay đổi theo thời gian, đặc biệt dưới ảnh hưởng của các chiến dịch quảng cáo và các yếu tố thời điểm như cuối tuần hoặc ngày lễ.     
+
+---
+
+**Các biến trong bộ dữ liệu bao gồm:**    
+
+* **`timestamp`**: Ngày ghi nhận dữ liệu (tần suất hằng ngày), là trục thời gian chính của chuỗi thời gian, kéo dài từ 01/01/2022 đến 31/12/2024.     
+* **`page_views`**: Trung bình số lượt xem trang trong ngày – là biến mục tiêu chính dùng để dự báo.   
+* **`ad_spend`**: Số tiền chi tiêu cho quảng cáo trực tuyến trong ngày.    
+* **`is_weekend`**: Biến nhị phân cho biết ngày đó có phải cuối tuần (Thứ Bảy, Chủ Nhật) hay không.    
+* **`day_of_week`**: Tên ngày trong tuần (Monday, Tuesday,...).     
+* **`is_holiday`**: Biến nhị phân thể hiện ngày đó có phải là ngày lễ hoặc dịp đặc biệt.    
+
+---
+**Mục tiêu phân tích:**    
+
+* 📅 Phát hiện chu kỳ tuần và mùa vụ ảnh hưởng đến hành vi người dùng (cuối tuần, ngày lễ).  
+* 📊 Đánh giá hiệu quả quảng cáo thông qua mối liên hệ giữa chi tiêu (`ad_spend`) và lượt truy cập (`page_views`). 
+* 📈 Dự báo số lượt xem trang (page views) dựa trên xu hướng quá khứ và yếu tố ngoại sinh như chi phí quảng cáo, ngày nghỉ.   
+  
+
+##### **Chuyển đổi các biến sang định dạng phù hợp:**   
+```{r}
+# Chuyển đổi định dạng ngày tháng
+web_data$timestamp <- as.Date(web_data$timestamp, format = "%m/%d/%Y")
+
+# Tạo cột mới: dạng factor (để biểu diễn trực quan)
+web_data$is_weekend_factor <- factor(web_data$is_weekend, levels = c(TRUE, FALSE), labels = c("Weekend", "Weekday"))
+web_data$is_holiday_factor <- factor(web_data$is_holiday, levels = c(TRUE, FALSE), labels = c("Holiday", "Non-Holiday"))
+
+# Tạo cột mới: dạng numeric (dùng cho mô hình)
+web_data$is_weekend_num <- as.numeric(web_data$is_weekend)  # TRUE -> 1, FALSE -> 0
+web_data$is_holiday_num <- as.numeric(web_data$is_holiday)
+
+# Thiết lập thứ tự ngày trong tuần
+web_data$day_of_week <- factor(
+  web_data$day_of_week,
+  levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
+  ordered = TRUE
+)
+
+str(web_data)
+summary(web_data)
+```
+Từ bảng mô tả dữ liệu:    
+
+* **page_views** (lượt xem trang): trung bình mỗi ngày có khoảng **1553 lượt xem**, dao động từ **868 đến 2287**. Điều này cho thấy lượng truy cập có sự biến động đáng kể giữa các ngày.    
+* **ad_spend** (chi phí quảng cáo): trung bình mỗi ngày chi 249.5 đơn vị tiền tệ, dao động từ 113 đến gần 680, cho thấy có sự khác biệt lớn giữa các ngày – phản ánh các chiến dịch quảng cáo khác nhau.     
+* **is_weekend**: có **314/1096 ngày** là cuối tuần (khoảng 28.65%), còn lại là ngày thường.      
+* **is_holiday**: chỉ có **12 ngày là ngày lễ** trong toàn bộ tập dữ liệu (khoảng 1.1%), cho thấy yếu tố này khá hiếm nhưng có thể ảnh hưởng lớn đến hành vi người dùng.   
+* **day_of_week** được phân bố đồng đều, mỗi thứ có khoảng 156–157 ngày — xác nhận dữ liệu theo tần suất hàng ngày liên tục không thiếu sót.     
+* Dữ liệu đã được xử lý thêm để có các biến dạng số (`0/1`) và biến định danh (`factor`) tương ứng với `is_weekend` và `is_holiday`, hỗ trợ cả mục tiêu mô hình hóa và trực quan hóa.             
+
+##### **Kiểm tra Missing Value:**
+```{r}
+# Tổng số giá trị NA toàn bộ dataset
+sum(is.na(web_data))
+
+# Số lượng NA theo từng biến
+colSums(is.na(web_data))
+```
+
+$\rightarrow$ Không có giá trị NA trong bộ dữ liệu.   
+
+##### **Kiểm tra giá trị ngoại lai (Outliers):**   
+
+Sử dụng quy tắc IQR (Interquartile Range – khoảng tứ phân vị) cho các biến định lượng để phát hiện outlier với IQR được tính bằng:
+
+$$
+IQR = Q_3 - Q_1
+$$
+
+Trong đó:    
+
+* $Q_1$: Phân vị thứ nhất (25%)   
+* $Q_3$: Phân vị thứ ba (75%)   
+
+Một quan sát được xem là **ngoại lai** nếu nó nằm ngoài khoảng:$[Q_1 - 1.5 \times IQR,\quad Q_3 + 1.5 \times IQR]$, tức là những giá trị nhỏ hơn $Q_1 - 1.5 \times IQR$ hoặc lớn hơn $Q_3 + 1.5 \times IQR$ được đánh dấu là outliers.    
+
+```{r}
+# Hàm kiểm tra outlier theo IQR
+check_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  return(which(x < lower_bound | x > upper_bound))
+}
+
+# Chỉ kiểm tra cho các biến định lượng
+out_page_views <- check_outliers(web_data$page_views)
+out_ad_spend   <- check_outliers(web_data$ad_spend)
+
+# Số lượng outlier
+length(out_page_views)
+length(out_ad_spend)
+```
+Boxplot trực quan hóa outlier:   
+```{r}
+boxplot(web_data$page_views, main = "Boxplot - Page Views", col = "skyblue")
+boxplot(web_data$ad_spend, main = "Boxplot - Ad Spend", col = "orange")
+```
+
+Nhận xét:    
+
+  - Biến `page_views` (lượt xem trang):    
+    + Biểu đồ hộp cho thấy phân phối của lượt xem trang khá đều, tập trung chủ yếu quanh giá trị trung vị.    
+    + Không có giá trị ngoại lai (outlier) đáng kể, cho thấy dữ liệu này không bị ảnh hưởng bởi các đột biến lớn trong hành vi người dùng.   
+    + Khoảng giữa (IQR) trải rộng từ khoảng 1350 đến 1750, cho thấy sự dao động tự nhiên của lưu lượng truy cập theo ngày là tương đối ổn định.    
+
+  - Biến `ad_spend` (chi phí quảng cáo):       
+    + Dữ liệu chi tiêu quảng cáo có phân phối lệch phải rõ rệt và chứa nhiều giá trị ngoại lai (77/1096 quan sát) vượt xa khỏi khoảng IQR.       
+    + Các giá trị outlier này đại diện cho những ngày có mức chi tiêu cao hơn mức trung bình đáng kể — có thể là các chiến dịch quảng cáo đặc biệt.     
+    + Dù là ngoại lai theo phương pháp IQR, nhưng những giá trị này có thể chứa đựng thông tin quan trọng, đặc biệt khi phân tích hiệu quả marketing và mô hình hóa mối quan hệ với `page_views`. Do đó, không nên loại bỏ ngay các giá trị ngoại lai của `ad_spend`.   
+
+
+##### **Kiểm tra tính dừng (Stationarity):**    
+Giả thuyết kiểm định Augmented Dickey-Fuller - ADF:   
+
+* $H_0$: non-stationary.
+* $H_1$: stationary.
+
+p-value:    
+
+* $p-value < 0.05$: bác bỏ H0, kết luận chuỗi dừng.   
+* $p-value \geqslant 0.05$: không đủ cơ sở bác bỏ H0, kết luận chuỗi không dừng.    
+
+```{r, warning=FALSE}
+# Chuyển đổi page_views thành chuỗi thời gian với tần suất hàng ngày (frequency = 1) và hàng tuần (frequency = 7)
+ts_page_views_1 <- ts(web_data$page_views, frequency = 1)
+ts_page_views <- ts(web_data$page_views, frequency = 7)
+
+# Thực hiện kiểm định ADF
+adf_result_1 <- adf.test(ts_page_views_1, alternative = "stationary")
+adf_result <- adf.test(ts_page_views, alternative = "stationary")
+
+# In kết quả
+print(adf_result_1)
+print(adf_result)
+```
+
+Giá trị p-value nhỏ hơn 0.05, ta bác bỏ giả thuyết $H_0$ – tức chuỗi là dừng (stationary), do đó có thể phù hợp để áp dụng mô hình ARMA/SARIMA trực tiếp hoặc tiếp tục kiểm tra thành phần mùa vụ.   
+
+##### **Kiểm tra hiện tượng heteroscedasticity** - phương sai thay đổi theo thời gian.       
+```{r}
+plot(ts_page_views_1, main = "Time Series Plot of Page Views (frequency = 1)")
+```
+
+Khi quan sát chuỗi page_views, ta thấy:   
+
+* Biên độ dao động tăng dần theo thời gian, từ khoảng 1200–1400 ở giai đoạn đầu lên đến 1600–2200 về sau. Đây là dấu hiệu trực quan có thể cho thấy chuỗi có thể có hiện tượng heteroscedasticity.   
+
+* Tuy nhiên, để đánh giá chính xác hơn, ta sử dụng biến đổi Box-Cox.   
+
+##### **Kiểm tra tính ổn định phương sai với biến đổi Box-Cox** để đánh giá xem chuỗi `page_views` có cần biến đổi để ổn định phương sai hay không.    
+
+* Nếu $\lambda \approx 1$ $\rightarrow$ không cần biến đổi.     
+* Nếu $\lambda < 1$ $\rightarrow$ nên dùng biến đổi (log, căn bậc hai, ...) để ổn định phương sai.     
+
+```{r}
+lambda_1 <- BoxCox.lambda(ts_page_views_1)   # frequency = 1
+lambda_1
+
+lambda <- BoxCox.lambda(ts_page_views)        # frequency = 7
+lambda
+```
+
+* Giá trị $\lambda = 0.91$ và $\lambda = 1.09$ đều gần bằng 1 cho thấy phương sai của chuỗi `page_views` là gần ổn định, không có dấu hiệu heteroscedasticity nghiêm trọng. Do đó, không cần áp dụng biến đổi Box-Cox (như log hoặc căn bậc hai) trước khi mô hình hóa.     
+
+
+#### *Step 2: Phát hiện chu kỳ tuần và mùa vụ ảnh hưởng đến hành vi người dùng (cuối tuần, ngày lễ):*      
+
+Trước khi xây dựng mô hình dự báo, việc khám phá dữ liệu ban đầu (exploratory data analysis – EDA) là bước quan trọng nhằm hiểu rõ đặc điểm cấu trúc chuỗi. Đặc biệt, việc kiểm tra xu hướng theo thời gian, chu kỳ mùa vụ, và ảnh hưởng của các yếu tố bên ngoài (như chi tiêu quảng cáo) giúp định hướng lựa chọn mô hình và giải thích kết quả hợp lý hơn.    
+
+**Page Views và Ad Spend theo thời gian:**   
+```{r}
+ggplot(web_data, aes(x = timestamp)) +
+  geom_line(aes(y = page_views, color = "Page Views")) +
+  geom_line(aes(y = ad_spend * max(page_views) / max(ad_spend), color = "Ad Spend")) +
+  scale_y_continuous(
+    name = "Page Views",
+    sec.axis = sec_axis(~ . * max(web_data$ad_spend) / max(web_data$page_views), name = "Ad Spend")
+  ) +
+  scale_color_manual(values = c("Page Views" = "steelblue", "Ad Spend" = "tomato")) +
+  labs(title = "Page Views và Ad Spend theo thời gian", x = "Ngày") +
+  theme_minimal()
+```
+
+Nhận xét:    
+
+1. **Xu hướng tổng thể:**     
+
+   * `Page Views` (lượt xem trang) và `Ad Spend` (chi tiêu quảng cáo) đều có xu hướng tăng dần theo thời gian từ năm 2022 đến 2024. Điều này cho thấy hoạt động quảng bá cũng như mức độ phổ biến của website đang tăng trưởng đều đặn.    
+
+2. **Biến động ngắn hạn:**     
+
+   * `Ad Spend` có nhiều biến động mạnh, với các đỉnh cao rõ rệt – phản ánh các chiến dịch quảng cáo ngắn hạn, có thể là dịp đặc biệt, sự kiện, hoặc dịp lễ.    
+   * `Page Views` có sự dao động nhẹ hơn, thể hiện phản ứng tự nhiên của người dùng nhưng vẫn có những biến động tương ứng với các đợt chi tiêu quảng cáo.
+
+3. **Tương quan trực quan:**           
+
+   * Có nhiều thời điểm mà sự gia tăng của `Ad Spend` trùng với sự tăng nhẹ của `Page Views`, đặc biệt ở những đỉnh chi tiêu lớn – điều này gợi ý mối liên hệ tích cực giữa quảng cáo và lượt truy cập.   
+   * Tuy nhiên, không phải lúc nào tăng chi tiêu cũng kéo theo tăng ngay `Page Views`, cho thấy cần thêm phân tích để xác định độ trễ thời gian (lag effect) hoặc hiệu quả theo ngữ cảnh (ngày thường vs ngày lễ/cuối tuần).    
+
+4. **Chu kỳ thời gian:**    
+
+   * Cả hai chuỗi đều thể hiện tính mùa vụ nhẹ, đặc biệt là những dao động ngắn hạn lặp lại định kỳ – có thể liên quan đến cuối tuần, đầu tháng hoặc ngày lễ.
+   * Mật độ dày đặc của `Page Views` theo dạng sóng đều đặn do đó có thể có chu kỳ tuần hoặc tháng.   
+
+
+**Phân phối Page Views theo Ngày Cuối Tuần / Ngày Thường:**    
+```{r}
+ggplot(web_data, aes(x = is_weekend_factor, y = page_views, fill = is_weekend_factor)) +
+  geom_boxplot() +
+  labs(title = "Phân phối Page Views theo Ngày Cuối Tuần/Ngày Thường",
+       x = "", y = "Lượt xem trang") +
+  theme_minimal()
+```
+
+Nhận xét:     
+
+1. **Lượt xem trang có xu hướng cao hơn vào cuối tuần:**
+
+   * Trung vị (median) của `Page Views` vào cuối tuần (Weekend) cao hơn so với ngày thường (Weekday). Điều này cho thấy người dùng có xu hướng truy cập trang web nhiều hơn vào cuối tuần.   
+
+2. **Độ phân tán cũng cao hơn vào cuối tuần:**     
+
+   * Chiều cao của hộp (interquartile range – IQR) vào cuối tuần lớn hơn → biến động lượt xem trang cao hơn so với ngày thường.     
+
+**Phân phối Page Views theo Ngày lễ:**    
+```{r}
+ggplot(web_data, aes(x = is_holiday_factor, y = page_views, fill = is_holiday_factor)) +
+  geom_boxplot() +
+  labs(title = "Phân phối Page Views theo Ngày lễ",
+       x = "", y = "Lượt xem trang") +
+  theme_minimal()
+```
+
+* Trung vị lượt xem trang trong ngày lễ cao hơn so với ngày thường, cho thấy xu hướng truy cập tăng trong các dịp lễ.    
+* Độ phân tán (khoảng tứ phân vị) trong nhóm ngày thường rộng hơn, phản ánh sự biến động lớn hơn về lượng truy cập so với ngày lễ.   
+* Nhóm ngày lễ có xuất hiện một số điểm ngoại lai (outlier) với giá trị thấp, có thể do một số ngày lễ không trùng với các chiến dịch quảng bá hoặc có ít nhu cầu truy cập.   
+* Lượt xem tối đa trong ngày thường lại cao hơn đáng kể so với ngày lễ, cho thấy có những ngày thường đạt được lượng truy cập vượt trội, có thể nhờ hiệu quả từ quảng cáo hoặc nội dung hấp dẫn.   
+ 
+
+##### **Kiểm tra chu kỳ mùa vụ:**      
+Để xác định cấu trúc phụ thuộc thời gian trong chuỗi `page_views`, ta sử dụng hai công cụ phổ biến trong phân tích chuỗi thời gian là hàm tự tương quan (ACF) và hàm tự tương quan riêng phần (PACF):     
+
+* **Hàm tự tương quan (ACF - Autocorrelation Function):**    
+  Đo lường mức độ tương quan giữa giá trị hiện tại của chuỗi với các giá trị quá khứ ở nhiều độ trễ (lags). ACF hữu ích để xác định thành phần MA (Moving Average) trong mô hình ARIMA, cũng như nhận diện tính mùa vụ (seasonality) nếu có mẫu lặp đều đặn.  
+
+* **Hàm tự tương quan riêng phần (PACF - Partial Autocorrelation Function):**   
+  Đo lường tương quan giữa các giá trị trong chuỗi với các giá trị quá khứ tại một độ trễ nhất định, loại bỏ ảnh hưởng gián tiếp của các độ trễ trung gian. PACF thường được sử dụng để xác định bậc của thành phần AR (AutoRegressive).    
+  
+```{r}
+acf(ts_page_views, lag.max = 60)
+pacf(ts_page_views, lag.max = 60)
+```
+
+Quan sát từ biểu đồ:  
+
+* ACF thể hiện các đỉnh nổi bật tại các độ trễ là bội số của 7 (lag = 7, 14, 21, ...), cho thấy chuỗi có mùa vụ theo tuần.   
+* PACF có nhiều giá trị vượt ngưỡng tin cậy trong khoảng từ lag = 1 đến 4, sau đó giảm dần và dao động quanh 0, thể hiện ảnh hưởng mạnh mẽ của các giá trị gần trong quá khứ.    
+
+
+#### *Step 3: Đánh giá hiệu quả quảng cáo thông qua mối liên hệ giữa chi tiêu (`ad_spend`) và lượt truy cập (`page_views`).* 
+
+**Mối quan hệ giữa Chi tiêu quảng cáo và Lượt xem trang:**           
+
+Để đánh giá hiệu quả của các chiến dịch quảng cáo, một cách tiếp cận đơn giản là kiểm tra mối quan hệ giữa chi tiêu quảng cáo (`ad_spend`) và hành vi người dùng (`page_views`). Trong trường hợp lý tưởng, ta kỳ vọng rằng khi chi tiêu tăng thì lượt xem trang sẽ tăng tương ứng. Phân tích hồi quy tuyến tính và hệ số tương quan Pearson là hai công cụ cơ bản giúp kiểm định giả thuyết này.   
+
+```{r}
+# Scatter plot giữa ad_spend và page_views
+ggplot(web_data, aes(x = ad_spend, y = page_views)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 1) +
+  labs(title = "Mối quan hệ giữa Chi tiêu quảng cáo và Lượt xem trang",
+       x = "Ad Spend", y = "Page Views") +
+  theme_minimal()
+
+```
+
+Nhận xét:       
+
+1. **Mối quan hệ gần như không rõ ràng (rất yếu):**
+
+   * Đường hồi quy tuyến tính (màu đỏ) gần như nằm ngang. Điều này cho thấy không có xu hướng tăng hay giảm rõ rệt giữa chi tiêu quảng cáo và lượt xem trang.   
+
+2. **Phân tán cao và không đồng đều:**
+
+   * Các điểm dữ liệu rải rác khá rộng, đặc biệt là với các mức chi tiêu thấp (tập trung nhiều ở khoảng dưới 300). Điều này cho thấy biến `page_views` chịu ảnh hưởng của nhiều yếu tố khác, không chỉ riêng `ad_spend`.
+
+3. **Dải tin cậy (confidence band):** Vùng xám thể hiện độ không chắc chắn cao, nhất là ở các mức chi tiêu cao, nơi dữ liệu thưa hơn. 
+
+
+**Phân tích tương quan:**  
+```{r}
+cor(web_data$ad_spend, web_data$page_views, use = "complete.obs")
+```
+Kết quả: -0.0035.     
+
+Hệ số này rất gần 0, cho thấy không có mối tương quan tuyến tính đáng kể giữa hai biến. Việc chi tiêu nhiều hơn không đồng nghĩa với việc số lượt xem tăng, ít nhất là theo xu hướng tuyến tính.    
+
+
+Sau khi thử kiểm tra mối quan hệ tuyến tính giữa biến chi tiêu quảng cáo (`ad_spend`) và lượt xem trang (`page_views`), kết quả cho thấy lượng truy cập trang không tăng đều theo chi tiêu quảng cáo, mà có thể chịu ảnh hưởng bởi nhiều yếu tố khác như thời điểm, nội dung, bối cảnh, ... Mô hình hồi quy tuyến tính chỉ phù hợp khi tồn tại mối quan hệ đơn điệu và tuyến tính giữa các biến, điều này không đúng với dữ liệu hiện tại.    
+
+##### **Phân tích độ trễ (lag) giữa `ad_spend` và `page_views`:**    
+
+Trong các hệ thống có phản ứng trễ, ví dụ như hiệu ứng quảng cáo, tác động của biến này lên biến kia thường không xảy ra đồng thời mà có thể kéo dài vài ngày. Hàm tương quan chéo (Cross-correlation Function – CCF) là công cụ giúp kiểm tra xem chuỗi x có ảnh hưởng tới chuỗi y sau một số độ trễ nhất định hay không.     
+
+```{r}
+ccf(web_data$ad_spend, web_data$page_views, lag.max = 30)
+```
+
+Giải thích:   
+
+* Lag > 0: `ad_spend` đi trước `page_views` -> phân tích liệu quảng cáo có ảnh hưởng tới lượt xem sau đó không.   
+* Lag < 0: `page_views` đi trước `ad_spend` -> khó có ý nghĩa thực tiễn.    
+
+Có nhiều giá trị CCF dương đáng kể tại độ trễ dương (ví dụ: Lag = 2, 3, 9, 10, ...). Cho thấy chi tiêu quảng cáo có tương quan dương rõ rệt với lượt xem sau vài ngày.     
+
+Một số giá trị tại Lag < 0 vượt khoảng tin cậy, nhưng khó có ý nghĩa vì quảng cáo không thể bị ảnh hưởng bởi lượt xem trong tương lai.     
+Phân tích CCF cho thấy chi tiêu quảng cáo có ảnh hưởng đến lượt truy cập sau 2 đến 3 ngày. Đây là bằng chứng cho thấy có hiệu ứng trễ (lag effect) trong phản ứng của người dùng với quảng cáo — họ không truy cập ngay lập tức mà thường cần vài ngày để phản hồi, tùy vào ngữ cảnh và nội dung quảng bá.    
+
+#### *Step 4: Dự báo số lượt xem trang (page views):*  
+
+Dựa trên các biểu đồ ACF và PACF của chuỗi `page_views` ở phần trước, ta tiến hành phân tích để xác định các thành phần của mô hình SARIMA như sau:    
+
+1. **Thành phần không mùa vụ (Non-seasonal):**   
+
+Ký hiệu: $(p, d, q)$    
+
+* **d = 0**: Do chuỗi đã được kiểm tra là dừng, nên không cần sai phân thường.   
+* **p = 2**: Biểu đồ PACF cho thấy hệ số tương quan riêng phần giảm mạnh và cắt cụt rõ ràng sau độ trễ 2, nên chọn bậc AR là 2.   
+* **q = 1 hoặc 2**: Biểu đồ ACF suy giảm dần theo dạng hàm mũ, không cắt cụt rõ ràng, gợi ý sự hiện diện của thành phần MA — đề xuất thử q = 1 hoặc 2.     
+
+2. **Thành phần mùa vụ (Seasonal):**    
+
+Ký hiệu: $(P, D, Q)_s$    
+
+* **s = 7**: Biểu đồ ACF cho thấy rõ ràng các đỉnh lặp lại tại các độ trễ là bội số của 7 (lag = 7, 14, 21...), phản ánh chu kỳ mùa vụ theo tuần.    
+* **D = 1**: Chuỗi vẫn còn xu hướng mùa vụ nên cần sai phân mùa vụ cấp 1 để làm ổn định.    
+* **P = 1, Q = 1**: Biểu đồ ACF và PACF đều có spike đáng kể tại lag = 7 $\rightarrow$ cho thấy nên đưa vào cả thành phần AR và MA mùa vụ.   
+
+3. **Đề xuất mô hình:**    
+
+$$
+\text{SARIMA}(2, 0, 1) \times (1, 1, 1)_7 \quad \text{hoặc} \quad \text{SARIMA}(2, 0, 2) \times (1, 1, 1)_7
+$$
+
+Hai mô hình này đều phù hợp với đặc trưng chuỗi và cần được so sánh thêm bằng các tiêu chí AIC, BIC và kiểm định phần dư để chọn mô hình tối ưu nhất.       
+
+##### **Ước lượng mô hình ARIMA (không có mùa vụ):**     
+
+Trong phân tích chuỗi thời gian, mô hình ARIMA (AutoRegressive Integrated Moving Average) là một trong những phương pháp phổ biến nhất để dự báo chuỗi có tính ổn định sau sai phân. Trước tiên, chúng tôi thử nghiệm mô hình ARIMA không có thành phần mùa vụ nhằm kiểm tra xem xu hướng và nhiễu ngẫu nhiên có thể được mô tả tốt mà không cần tính đến chu kỳ hay không.   
+
+```{r}
+# Tìm mô hình ARIMA tốt nhất (không tính mùa vụ)
+best_arima <- auto.arima(ts_page_views_1, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+summary(best_arima)
+```
+
+Đầu tiên, chúng tôi thử ước lượng mô hình ARIMA không mùa vụ. Mô hình được lựa chọn là ARIMA(4,1,1) with drift, tuy nhiên các tiêu chí đánh giá như AIC (13360.54) và RMSE (107.03) cho thấy mô hình chưa thật sự tối ưu.    
+ 
+
+##### **Ước lượng mô hình SARIMA (có yếu tố mùa vụ):**   
+```{r}
+# Dò tìm mô hình SARIMA tự động có mùa vụ
+model_sarima <- auto.arima(ts_page_views,
+                           seasonal = TRUE,
+                           stepwise = FALSE,
+                           approximation = FALSE)
+
+# Hiển thị kết quả
+summary(model_sarima)
+
+```
+
+Tiếp theo, khi đưa yếu tố mùa vụ vào mô hình bằng `auto.arima()` với `seasonal = TRUE`, mô hình $\text{SARIMA}(4,0,0)\times(0,1,1)_7$ được chọn với AIC = 13015.95, RMSE = 94.03 và MAPE ≈ 4.91% (rất tốt vì thường <10% được xem là mô hình dự báo tốt). Điều này chứng minh rằng yếu tố mùa vụ theo tuần có ý nghĩa và giúp mô hình dự báo tốt hơn.    
+
+Mô hình ARIMA truyền thống chỉ phù hợp với các chuỗi thời gian không có tính mùa vụ rõ ràng. Trong khi đó, SARIMA cho phép mô hình hóa các chuỗi có hành vi lặp lại theo chu kỳ, như lượt truy cập theo tuần, tháng,... Việc thêm thành phần mùa vụ giúp tăng độ chính xác khi các đặc điểm chu kỳ là nổi bật và lặp lại ổn định.     
+
+
+```{r}
+# Hiển thị phần dư
+checkresiduals(model_sarima)
+```
+
+Sau khi ước lượng mô hình $\text{SARIMA}(4,0,0)\times(0,1,1)_7$, phần dư của mô hình được kiểm tra bằng hàm `checkresiduals()`.
+Kết quả kiểm định Ljung–Box cho thấy:    
+$$
+Q^* = 29.36,\quad df = 9,\quad p\text{-value} = 0.00056
+$$
+Vì $p-value < 0.01$, ta bác bỏ giả thuyết $H_0$ rằng phần dư là nhiễu trắng.    
+Ngoài ra:    
+ 
+**1. Biểu đồ thời gian phần dư (top panel)**   
+
+* Dãy phần dư dao động quanh giá trị trung bình 0, không có xu hướng rõ rệt, cho thấy đã loại bỏ được xu hướng tuyến tính khỏi dữ liệu gốc.   
+* Tuy nhiên, biên độ dao động tương đối lớn, và xuất hiện một số điểm nhiễu mạnh.    
+
+**2. Biểu đồ ACF của phần dư (bottom-left panel)**     
+
+* Một số giá trị ACF nằm ngoài khoảng tin cậy (đường xanh), cho thấy phần dư vẫn còn tự tương quan.   
+* Điều này xác nhận lại kết quả kiểm định Ljung–Box trước đó (p-value = 0.00056), rằng phần dư không hoàn toàn là white noise.   
+
+**3. Biểu đồ histogram và mật độ phần dư (bottom-right panel)**   
+
+* Dạng phân phối phần dư khá giống chuẩn, nhưng vẫn còn hiện tượng lệch nhẹ.    
+
+Tất cả các điều trên cho thấy mô hình SARIMA hiện tại chưa mô tả hết cấu trúc chuỗi thời gian, và có thể cần điều chỉnh thêm để cải thiện.    
+
+##### **Thử nghiệm mô hình SARIMAX với biến ngoại sinh:**    
+
+Mục tiêu: Kiểm tra xem các yếu tố ngoài chuỗi thời gian như chi tiêu quảng cáo (`ad_spend`), ngày cuối tuần (`is_weekend`) và ngày lễ (`is_holiday`) có giúp cải thiện độ chính xác dự báo hay không.     
+
+```{r}
+# Mô hình có yếu tố ngoại sinh như chi phí quảng cáo, ngày nghỉ
+ad_spend_scaled <- scale(web_data$ad_spend)   
+xreg_std <- cbind(
+  ad_spend_scaled,
+  web_data$is_weekend_num,
+  web_data$is_holiday_num
+)
+
+model_sarimax <- auto.arima(ts_page_views, xreg = xreg_std,
+                         seasonal = TRUE,
+                         stepwise = FALSE, approximation = FALSE)
+
+summary(model_sarimax)
+```
+
+Nhận xét:   
+
+* Mặc dù mô hình SARIMAX với biến ngoại sinh (ad_spend, is_weekend, is_holiday) được thử nghiệm nhằm cải thiện độ chính xác dự báo, kết quả cho thấy mô hình này có AIC = 13297.77 và RMSE = 103.68, đều cao hơn so với mô hình SARIMA đã chọn trước đó (AIC = 13015.95, RMSE = 94.03).    
+* Việc mô hình SARIMAX không mang lại cải thiện đáng kể cho thấy các biến ngoại sinh có thể đã được mô hình hóa gián tiếp qua thành phần mùa vụ (weekly seasonality). Ngoài ra, ảnh hưởng của biến ngoại sinh có thể là phi tuyến, điều mà mô hình ARIMA không thể nắm bắt được.      
+* Do đó, chúng tôi quyết định không sử dụng SARIMAX, thay vào đó chúng tôi sẽ tiếp tục kiểm tra với mô hình SARIMA thủ công thông qua biểu đồ ACF và PACF.           
+
+##### **Mô hình SARIMA thủ công từ ACF và PCF:**      
+    
+```{r}
+# Mô hình từ auto.arima:
+model_base <- Arima(ts_page_views, order = c(4, 0, 0),
+                    seasonal = list(order = c(0, 1, 1), period = 7))
+
+# Mô hình từ ACF và PACF:
+model_alt1 <- Arima(ts_page_views, order = c(2, 0, 1),
+                    seasonal = list(order = c(1, 1, 1), period = 7))
+
+model_alt2 <- Arima(ts_page_views, order = c(2, 0, 2),
+                    seasonal = list(order = c(1, 1, 1), period = 7))
+# Mô hình thử nghiệm khi nâng bậc AR cao hơn mô hình ước lượng từ auto.arima
+model_alt3 <- Arima(ts_page_views, order = c(5, 0, 1),
+                    seasonal = list(order = c(1, 1, 1), period = 7))
+
+model_alt4 <- Arima(ts_page_views, order = c(5, 0, 2),
+                    seasonal = list(order = c(1, 1, 1), period = 7))
+
+```
+
+**So sánh các chỉ số:**      
+
+```{r}
+model_list <- list(
+  SARIMA_400_011 = model_base,
+  SARIMAX = model_sarimax,
+  SARIMA_201_111 = model_alt1,
+  SARIMA_202_111 = model_alt2,
+  SARIMA_501_111 = model_alt3,
+  SARIMA_502_111 = model_alt4
+)
+
+get_AICc <- function(model) {
+  n <- length(model$x)
+  k <- length(model$coef)
+  aic <- AIC(model)
+  aicc <- aic + (2 * k * (k + 1)) / (n - k - 1)
+  return(aicc)
+}
+
+get_RMSE <- function(model) {
+  return(forecast::accuracy(model)[1, "RMSE"])
+}
+
+get_MAPE <- function(model) {
+  return(forecast::accuracy(model)[1, "MAPE"])
+}
+
+
+model_metrics <- data.frame(
+  Model = names(model_list),
+  AIC = sapply(model_list, AIC),
+  AICc = sapply(model_list, get_AICc),
+  BIC = sapply(model_list, BIC),
+  RMSE = sapply(model_list, get_RMSE),
+  MAPE = sapply(model_list, get_MAPE)
+)
+
+print(model_metrics)
+```
+
+**Kiểm tra phần dư (ACF, histogram, Ljung–Box):**
+```{r}
+checkresiduals(model_base)
+checkresiduals(model_sarimax)
+checkresiduals(model_alt1)
+checkresiduals(model_alt2)
+checkresiduals(model_alt3)
+checkresiduals(model_alt4)
+```
+
+Kết luận:    
+
+* Các mô hình SARIMA từ hàm auto.arima và SARIMAX được đề xuất và mô hình từ biểu đồ ACF, PACF chưa mô tả hết cấu trúc chuỗi thời gian. Phần dư vẫn còn thông tin, thể hiện qua: (1) ACF phần dư còn vượt ngưỡng, (2) Kiểm định Ljung–Box cho p-value < 0.05.     
+* Về các mô hình $\text{SARIMA}(5,0,1) \times (1,1,1)_7$ và $\text{SARIMA}(5,0,2) \times (1,1,1)_7$:         
+    + **Phân phối phần dư:** Histogram phần dư của cả hai mô hình đều có hình dạng gần giống phân phối chuẩn, với đường cong mật độ (đỏ) bám sát histogram — đây là dấu hiệu tốt cho giả định phân phối chuẩn của sai số.    
+    + **Tự tương quan phần dư (ACF):**Các biểu đồ ACF của phần dư đều cho thấy hầu hết các giá trị nằm trong khoảng tin cậy 95%, không có bằng chứng rõ ràng về hiện tượng tự tương quan còn sót lại. Điều này cho thấy phần dư không còn mang thông tin có thể khai thác, đáp ứng giả định white noise.    
+    + **Kiểm định Ljung-Box:** Mô hình $\text{SARIMA}(5,0,1) \times (1,1,1)_7$ (p-value = 0.6538) và  $\text{SARIMA}(5,0,2) \times (1,1,1)_7$ (p-value = 0.7187) đều lớn hơn 0.05 nên ta không đủ cơ sở bác bỏ giả thuyết $H_0$ (phần dư là white noise), do đó không có bằng chứng về hiện tượng tự tương quan còn lại trong phần dư.    
+
+##### **Lựa chọn mô hình SARIMA tốt nhất để dự báo:**   
+
+Sau khi thử nhiều mô hình SARIMA với các cấu hình khác nhau về bậc ARIMA và thành phần mùa vụ, mô hình được lựa chọn là:    
+
+$$
+\text{SARIMA}(5,0,2)\times(1,1,1)_7
+$$
+
+**Lý do lựa chọn:**   
+
+* Đây là một trong hai mô hình có AIC, BIC, AICc, RMSE và MAPE thấp nhất, cho thấy hiệu năng dự báo vượt trội.    
+* Số lượng tham số lớn hơn giúp mô hình linh hoạt hơn trong việc mô tả các đặc trưng của chuỗi.    
+* Kiểm định Ljung–Box cho thấy p-value cao hơn, tức phần dư có tính chất white noise tốt hơn.   
+* Phân phối phần dư gần chuẩn hơn, đảm bảo giả định thống kê về sai số được đáp ứng.    
+
+##### **Kiểm tra overfitting cho mô hình dự báo:**   
+
+Để đánh giá khả năng tổng quát hóa của mô hình và kiểm tra hiện tượng overfitting (quá khớp), chúng tôi tiến hành chia dữ liệu thành hai phần:   
+
+* Tập huấn luyện (training set): toàn bộ chuỗi trừ 15 ngày cuối.    
+* Tập kiểm định (test set): 15 ngày cuối cùng.    
+
+```{r}
+# Chia dữ liệu: giữ lại 15 ngày cuối làm test
+train_ts <- window(ts_page_views, end = c(156, 7))  # Dữ liệu có tần suất hàng ngày và tuần thứ 156 là tuần gần cuối
+test_ts  <- window(ts_page_views, start = c(157, 1))
+
+# Huấn luyện mô hình SARIMA(5,0,2)(1,1,1)[7] trên tập train
+fit_train <- Arima(train_ts, order = c(5,0,2),
+                   seasonal = list(order = c(1,1,1), period = 7))
+
+# Dự báo 15 bước tương lai (bằng độ dài của test)
+n_test <- length(test_ts)
+fc_test <- forecast(fit_train, h = n_test)
+
+# Hiển thị biểu đồ dự báo và dữ liệu thực tế
+autoplot(fc_test) + autolayer(test_ts, series = "Test data")
+
+
+# Sai số trên tập kiểm định
+rmse_test <- rmse(actual = test_ts, predicted = fc_test$mean)
+mape_test <- mape(actual = test_ts, predicted = fc_test$mean)
+
+cat("RMSE (Test):", rmse_test, "\n")
+cat("MAPE (Test):", mape_test, "\n")
+
+
+# Dự báo fitted values từ mô hình huấn luyện
+fitted_values <- fitted(fit_train)
+
+# Sai số thủ công
+rmse_train <- sqrt(mean((train_ts - fitted_values)^2))
+mape_train <- mean(abs((train_ts - fitted_values)/train_ts)) * 100
+
+cat("RMSE (Train):", rmse_train, "\n")
+cat("MAPE (Train):", mape_train, "\n")
+
+
+```
+
+Mô hình $\text{SARIMA}(5,0,2)\times(1,1,1)_7$ được huấn luyện trên tập huấn luyện và sau đó dự báo 15 bước tiếp theo. Kết quả sai số như sau:   
+
+|                    | RMSE  | MAPE (%) |
+| ------------------ | ----- | -------- |
+| **Tập huấn luyện** | 89.39 | 4.72     |
+| **Tập kiểm định**  | 90.69 | 3.21     |
+
+* RMSE của tập kiểm định (90.69) chỉ nhỉnh hơn nhẹ so với huấn luyện (89.39) $\rightarrow$ cho thấy mô hình dự báo ổn định và không có dấu hiệu overfit.   
+* MAPE của tập kiểm định (3.21%) còn thấp hơn huấn luyện (4.72%), cho thấy mô hình hoạt động rất tốt trên dữ liệu, tăng độ tin cậy cho các dự báo tương lai.    
+
+Do đó, có thể kết luận rằng mô hình đã học được cấu trúc chuỗi một cách hiệu quả và có khả năng tổng quát hóa tốt mà không bị quá khớp dữ liệu quá khứ.    
+
+##### **Dự báo 15 ngày tiếp theo:**   
+```{r}
+sarima_result_15 <- sarima.for(ts_page_views, n.ahead = 15,
+           p = 5, d = 0, q = 2,
+           P = 1, D = 1, Q = 1, S = 7)
+sarima_result_15
+
+# Dự báo và sai số chuẩn
+pred <- as.numeric(sarima_result_15$pred)  
+se <- as.numeric(sarima_result_15$se)      
+
+# Tính lower và upper bounds
+lower <- pred - 1.96 * se
+upper <- pred + 1.96 * se
+
+ci_table <- data.frame(
+  Day = 1:length(pred),
+  Forecast = pred,
+  SE = se,
+  CI_Lower = lower,
+  CI_Upper = upper
+)
+
+print(ci_table)
+```
+
+Dải tin cậy 95% được tính dựa trên công thức:    
+
+$$
+\text{CI}_{\text{Lower}} = \hat{y}_t - 1.96 \cdot SE_t, \quad \text{CI}_{\text{Upper}} = \hat{y}_t + 1.96 \cdot SE_t
+$$
+
+Trong đó:   
+
+* $\hat{y}_t$: Giá trị dự báo tại thời điểm t.   
+* $SE_t$: Sai số chuẩn của dự báo tại thời điểm t.    
+* $1.96$: Hệ số ứng với mức tin cậy 95% trong phân phối chuẩn.     
+
+Dự báo được thực hiện cho 15 ngày tiếp theo bằng mô hình $\text{SARIMA}(5,0,2)\times(1,1,1)_7$ đã cho thấy kết quả hợp lý và đáng tin cậy.    
+
+1. **Tính mùa vụ được mô hình hóa rõ ràng**
+
+Chuỗi giá trị dự báo thể hiện đặc trưng chu kỳ 7 ngày rõ nét, với các đỉnh và đáy lặp lại đều đặn, phản ánh tính mùa vụ theo tuần trong hành vi truy cập trang:   
+
+* Giá trị dự báo dao động từ 1788 đến 2175, phù hợp với biên độ quan sát thực tế trước đó.   
+* Nhịp điệu tăng – giảm theo tuần được duy trì, cho thấy mô hình đã học tốt cấu trúc chuỗi.    
+
+2. **Sai số chuẩn ổn định và hợp lý**     
+
+Sai số chuẩn (`$se`) tăng nhẹ từ khoảng 89.4 đến 97.2 trong suốt 15 bước dự báo. Điều này cho thấy:   
+
+* Mức độ không chắc chắn chỉ tăng nhẹ khi tiến xa hơn vào tương lai.   
+* Mô hình ổn định và không có dấu hiệu nhiễu loạn hoặc "mở rộng bất định" theo thời gian như các mô hình kém chất lượng.   
+
+3. **Khoảng tin cậy 95% phản ánh rõ tính chu kỳ của bất định**   
+
+Khoảng tin cậy được biểu diễn bằng vùng xám trong biểu đồ có đặc điểm đặc biệt:   
+
+* Không mở rộng đều, mà dao động theo chu kỳ: rộng hơn tại các điểm đỉnh và đáy của chuỗi dự báo.   
+* Điều này cho thấy tại các thời điểm biến động mạnh (cực đại và cực tiểu), độ không chắc chắn của mô hình tăng lên — một hiện tượng hợp lý trong thực tiễn, vì những thay đổi nhanh thường khó dự báo chính xác hơn.     
+* Ngược lại, tại các điểm gần trung bình hoặc ổn định, vùng tin cậy hẹp hơn, phản ánh mức độ dự báo chắc chắn hơn.    
+
+##### **Dự báo 30 ngày tiếp theo:**   
+```{r}
+sarima_result_30 <- sarima.for(ts_page_views, n.ahead = 30,
+           p = 5, d = 0, q = 2,
+           P = 1, D = 1, Q = 1, S = 7)
+sarima_result_30
+
+# Dự báo và sai số chuẩn
+pred <- as.numeric(sarima_result_30$pred)  
+se <- as.numeric(sarima_result_30$se)      
+
+# Tính lower và upper bounds
+lower <- pred - 1.96 * se
+upper <- pred + 1.96 * se
+
+ci_table <- data.frame(
+  Day = 1:length(pred),
+  Forecast = pred,
+  SE = se,
+  CI_Lower = lower,
+  CI_Upper = upper
+)
+
+print(ci_table)
+```
+
+Dự báo được thực hiện cho 30 ngày tiếp theo bằng mô hình $\text{SARIMA}(5,0,2) \times(1,1,1)_7$ đã cho thấy kết quả hợp lý và có độ tin cậy cao.   
+
+1. **Tính mùa vụ được mô hình hóa rõ ràng**    
+
+Chuỗi giá trị dự báo tiếp tục thể hiện tính chu kỳ 7 ngày đều đặn, với các đỉnh và đáy lặp lại đúng nhịp tuần:   
+
+* Giá trị dự báo dao động trong khoảng từ khoảng 1790 đến 2183, phù hợp với biên độ biến thiên đã quan sát trong chuỗi dữ liệu gốc.   
+* Mô hình đã học và tái hiện được nhịp điệu mùa vụ một cách chính xác — các giai đoạn tăng và giảm theo tuần vẫn được duy trì nhất quán.   
+
+2. **Sai số chuẩn tăng nhẹ, ổn định và hợp lý**   
+
+Sai số chuẩn (`$se`) tăng từ 89.4 đến 101.3 qua 30 bước dự báo, với xu hướng tăng dần rất mượt:   
+
+* Điều này là đặc trưng của các mô hình chuỗi thời gian tốt, khi sai số chỉ tăng dần nhẹ do dự báo xa hơn.   
+* Mức tăng sai số là hợp lý, không đột ngột, chứng tỏ mô hình hoạt động ổn định và không gặp vấn đề nhiễu hoặc phình sai số.   
+
+3. **Khoảng tin cậy 95% phản ánh rõ tính chu kỳ của bất định**   
+
+Vùng xám biểu diễn khoảng tin cậy 95% trong biểu đồ thể hiện sự thay đổi không đều, mang tính chu kỳ rõ ràng:   
+
+* Tại các đỉnh và đáy của chuỗi dự báo, khoảng tin cậy rộng hơn — điều này phản ánh mức độ bất định cao hơn khi mô hình dự báo các điểm biến động mạnh.    
+* Tại các điểm gần trung bình chu kỳ, vùng tin cậy hẹp lại — thể hiện mức độ chắc chắn cao hơn ở các thời điểm ổn định.    
+
+Đây là đặc trưng hợp lý với chuỗi có mùa vụ mạnh, vì sự chuyển pha giữa tăng – giảm luôn tiềm ẩn rủi ro dự báo cao hơn.         
+
+
+#### *Step 5: Kết luận:*    
+
+Trong phần nghiên cứu này, chúng tôi đã tiến hành phân tích chuỗi thời gian đối với biến lượt xem trang (`page_views`) bằng các mô hình ARIMA, SARIMA, SARIMAX nhằm mục tiêu dự báo ngắn hạn cho 15 và 30 ngày kế tiếp.    
+
+Thông qua quá trình kiểm tra tính dừng, nhận diện yếu tố mùa vụ, đánh giá phần dư và so sánh các chỉ số AIC, BIC, AICc, RMSE, MAPE giữa các mô hình, chúng tôi nhận thấy rằng mô hình $\text{SARIMA}(5,0,2)×(1,1,1)_7$ là mô hình phù hợp nhất cho dữ liệu này. Mô hình đã phản ánh tốt cấu trúc mùa vụ theo tuần và cho kết quả dự báo ổn định với sai số thấp.      
+
+Mô hình được lựa chọn không chỉ thể hiện hiệu quả tốt qua các chỉ số đo lường trên tập huấn luyện, mà còn được xác nhận thông qua kiểm tra overfitting với tập kiểm định. Sai số dự báo trên dữ liệu kiểm tra cho thấy mô hình tổng quát hóa tốt, không bị quá khớp và giữ được độ chính xác khi áp dụng vào dữ liệu.    
+
+Ngoài ra, kết quả dự báo cho 15 và 30 ngày tiếp theo đều phản ánh rõ tính mùa vụ theo chu kỳ 7 ngày, với các đỉnh và đáy lặp lại đều đặn. Dải sai số chuẩn và khoảng tin cậy 95% cũng tăng nhẹ theo thời gian – đặc trưng hợp lý đối với dự báo chuỗi thời gian – và dao động theo nhịp tuần, cho thấy mô hình đã học được không chỉ xu hướng trung tâm mà cả đặc tính bất định theo mùa.    
+
+Trong tương lai, việc tích hợp thêm các biến ngoại sinh có tính phi tuyến có thể là một hướng mở nhằm nâng cao hơn nữa hiệu năng dự báo khi hành vi người dùng trở nên phức tạp hơn.    
